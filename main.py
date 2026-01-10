@@ -29,16 +29,21 @@ def separate_vocals(audio_path: str, output_dir: str) -> str:
     # Tách vocals
     output_files = separator.separate(audio_path)
 
+    print(f"[DEBUG] Output files: {output_files}")
+
     # Tìm file vocals trong kết quả
     for f in output_files:
         if "Vocals" in f or "vocal" in f.lower():
+            print(f"[DEBUG] Found vocals file: {f}")
             return f
 
     # Nếu có output, dùng file đầu tiên
     if output_files:
+        print(f"[DEBUG] Using first file: {output_files[0]}")
         return output_files[0]
 
     # Nếu không tìm thấy, dùng file gốc
+    print(f"[DEBUG] No output, using original: {audio_path}")
     return audio_path
 
 
