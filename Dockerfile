@@ -2,8 +2,8 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install ffmpeg
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+# Install ffmpeg and build tools
+RUN apt-get update && apt-get install -y ffmpeg gcc build-essential && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies
 COPY requirements.txt .
