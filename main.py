@@ -211,6 +211,42 @@ async def transcribe_and_download(
         raise HTTPException(status_code=500, detail=f"Lỗi xử lý: {str(e)}")
 
 
+@app.post("/transcribe-simple", response_class=PlainTextResponse)
+async def transcribe_simple(
+    file: UploadFile = File(...),
+    language: str = None
+):
+    """Test endpoint - không có audio separation"""
+    temp_dir = tempfile.mkdtemp()
+    temp_audio_path = os.path.join(temp_dir, file.filename)
+
+    try:
+        with open(temp_audio_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+
+        print(f"[DEBUG] Transcribing: {temp_audio_path}")
+
+        segments, info = model.transcribe(
+            temp_audio_path,
+            language=language,
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=False,
+            no_speech_threshold=0.6,
+            hallucination_silence_threshold=0.5
+        )
+
+        segments_list = list(segments)
+        print(f"[DEBUG] Found {len(segments_list)} segments")
+
+        srt_content = create_srt_content(segments_list)
+        return PlainTextResponse(content=srt_content)
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 @app.get("/")
 async def root():
     """API Info"""
@@ -218,8 +254,9 @@ async def root():
         "message": "MP3 to SRT API",
         "docs": "/docs",
         "endpoints": {
-            "/transcribe": "POST - Chuyển MP3 thành SRT (trả về text)",
-            "/transcribe/download": "POST - Chuyển MP3 thành SRT (download file)"
+            "/transcribe": "POST - Chuyển MP3 thành SRT (có tách vocals)",
+            "/transcribe-simple": "POST - Chuyển MP3 thành SRT (không tách vocals)",
+            "/transcribe/download": "POST - Download file SRT"
         }
     }
 
