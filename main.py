@@ -14,7 +14,7 @@ app = FastAPI(
 )
 
 # Load Whisper model
-model = WhisperModel("medium", device="cpu", compute_type="int8")
+model = WhisperModel("small", device="cpu", compute_type="int8")
 
 # Load Audio Separator
 separator = Separator()
