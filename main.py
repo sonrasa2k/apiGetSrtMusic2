@@ -26,15 +26,24 @@ def convert_to_mp3(wav_path: str, output_dir: str) -> str:
     """Convert WAV to MP3 to reduce memory usage"""
     mp3_path = os.path.join(output_dir, "vocals_compressed.mp3")
     try:
-        subprocess.run([
+        wav_size = os.path.getsize(wav_path) / (1024 * 1024)
+        print(f"[DEBUG] WAV file size: {wav_size:.2f} MB")
+
+        result = subprocess.run([
             "ffmpeg", "-i", wav_path,
-            "-acodec", "libmp3lame", "-b:a", "128k",
+            "-acodec", "libmp3lame", "-b:a", "256k",
             "-y", mp3_path
-        ], check=True, capture_output=True)
-        print(f"[DEBUG] Converted to MP3: {mp3_path}")
+        ], check=True, capture_output=True, text=True)
+
+        mp3_size = os.path.getsize(mp3_path) / (1024 * 1024)
+        print(f"[DEBUG] Converted to MP3: {mp3_path} ({mp3_size:.2f} MB)")
+
         # Remove large WAV file to free disk space
         os.remove(wav_path)
         return mp3_path
+    except subprocess.CalledProcessError as e:
+        print(f"[DEBUG] FFmpeg error: {e.stderr}")
+        return wav_path
     except Exception as e:
         print(f"[DEBUG] FFmpeg conversion failed: {e}, using original")
         return wav_path
