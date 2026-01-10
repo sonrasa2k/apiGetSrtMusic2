@@ -10,7 +10,7 @@ services:
       - model_cache:/root/.cache
     environment:
       - PYTHONUNBUFFERED=1
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 3
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
 
 volumes:
   model_cache:
