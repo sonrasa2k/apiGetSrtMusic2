@@ -1,6 +1,7 @@
 import os
 import tempfile
 import shutil
+import subprocess
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse
 from faster_whisper import WhisperModel
@@ -21,6 +22,24 @@ separator = Separator()
 separator.load_model("UVR-MDX-NET-Voc_FT.onnx")
 
 
+def convert_to_mp3(wav_path: str, output_dir: str) -> str:
+    """Convert WAV to MP3 to reduce memory usage"""
+    mp3_path = os.path.join(output_dir, "vocals_compressed.mp3")
+    try:
+        subprocess.run([
+            "ffmpeg", "-i", wav_path,
+            "-acodec", "libmp3lame", "-b:a", "128k",
+            "-y", mp3_path
+        ], check=True, capture_output=True)
+        print(f"[DEBUG] Converted to MP3: {mp3_path}")
+        # Remove large WAV file to free disk space
+        os.remove(wav_path)
+        return mp3_path
+    except Exception as e:
+        print(f"[DEBUG] FFmpeg conversion failed: {e}, using original")
+        return wav_path
+
+
 def separate_vocals(audio_path: str, output_dir: str) -> str:
     """Tách vocals từ audio file, trả về path đến file vocals"""
     # Cấu hình output directory
@@ -31,20 +50,26 @@ def separate_vocals(audio_path: str, output_dir: str) -> str:
 
     print(f"[DEBUG] Output files: {output_files}")
 
+    vocals_file = None
     # Tìm file vocals trong kết quả
     for f in output_files:
         if "Vocals" in f or "vocal" in f.lower():
             print(f"[DEBUG] Found vocals file: {f}")
-            return f
+            vocals_file = f
+            break
 
     # Nếu có output, dùng file đầu tiên
-    if output_files:
+    if not vocals_file and output_files:
         print(f"[DEBUG] Using first file: {output_files[0]}")
-        return output_files[0]
+        vocals_file = output_files[0]
 
     # Nếu không tìm thấy, dùng file gốc
-    print(f"[DEBUG] No output, using original: {audio_path}")
-    return audio_path
+    if not vocals_file:
+        print(f"[DEBUG] No output, using original: {audio_path}")
+        return audio_path
+
+    # Convert WAV to MP3 to reduce memory usage
+    return convert_to_mp3(vocals_file, output_dir)
 
 
 def format_timestamp(seconds: float) -> str:
