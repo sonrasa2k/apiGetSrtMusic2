@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+*.srt
+test_api.py
+.git/
+*.md

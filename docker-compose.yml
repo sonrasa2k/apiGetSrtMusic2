@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    volumes:
+      - model_cache:/root/.cache
+    environment:
+      - PYTHONUNBUFFERED=1
+
+volumes:
+  model_cache:
