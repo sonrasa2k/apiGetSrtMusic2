@@ -1,54 +1,60 @@
 import os
 import tempfile
 import shutil
+import asyncio
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse
 from faster_whisper import WhisperModel
 from audio_separator.separator import Separator
 
 
-app = FastAPI(
-    title="MP3 to SRT API",
-    description="API chuyển đổi file MP3 thành file SRT sử dụng Faster-Whisper",
-    version="1.0.0"
-)
+# Queue và worker config
+MAX_WORKERS = 2
+task_queue: asyncio.Queue = None
+executor: ThreadPoolExecutor = None
+results: dict = {}
 
-# Load Whisper model
-model = WhisperModel("medium", device="cpu", compute_type="int8")
+# Models (load một lần, dùng chung)
+model: WhisperModel = None
+separator: Separator = None
 
-# Load Audio Separator
-separator = Separator()
-separator.load_model("UVR-MDX-NET-Voc_FT.onnx")
+
+def load_models():
+    """Load models một lần khi startup"""
+    global model, separator
+    print("[INFO] Loading Whisper model...")
+    model = WhisperModel("medium", device="cpu", compute_type="int8")
+    print("[INFO] Loading Audio Separator model...")
+    separator = Separator()
+    separator.load_model("UVR-MDX-NET-Voc_FT.onnx")
+    print("[INFO] Models loaded!")
 
 
 def separate_vocals(audio_path: str, output_dir: str) -> str:
     """Tách vocals từ audio file, trả về path đến file vocals"""
-    # Cấu hình output directory
     separator.output_dir = output_dir
-
-    # Tách vocals
     output_files = separator.separate(audio_path)
 
     print(f"[DEBUG] Output files: {output_files}")
 
-    # Tìm file vocals trong kết quả
     for f in output_files:
         if "Vocals" in f or "vocal" in f.lower():
             print(f"[DEBUG] Found vocals file: {f}")
             return f
 
-    # Nếu có output, dùng file đầu tiên
     if output_files:
         print(f"[DEBUG] Using first file: {output_files[0]}")
         return output_files[0]
 
-    # Nếu không tìm thấy, dùng file gốc
     print(f"[DEBUG] No output, using original: {audio_path}")
     return audio_path
 
 
 def format_timestamp(seconds: float) -> str:
-    """Chuyển đổi giây thành định dạng SRT timestamp (HH:MM:SS,mmm)"""
+    """Chuyển đổi giây thành định dạng SRT timestamp"""
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
@@ -63,28 +69,103 @@ def create_srt_content(segments) -> str:
         start_time = format_timestamp(segment.start)
         end_time = format_timestamp(segment.end)
         text = segment.text.strip()
-
         srt_lines.append(f"{i}")
         srt_lines.append(f"{start_time} --> {end_time}")
         srt_lines.append(text)
-        srt_lines.append("")  # Dòng trống giữa các subtitle
-
+        srt_lines.append("")
     return "\n".join(srt_lines)
 
 
-@app.post("/transcribe", response_class=PlainTextResponse)
-async def transcribe_audio(
-    file: UploadFile = File(..., description="File MP3 cần chuyển đổi"),
-    language: str = None
-):
-    """
-    Chuyển đổi file MP3 thành nội dung SRT.
+def process_audio_task(task_data: dict) -> str:
+    """Xử lý task trong thread pool (blocking)"""
+    audio_path = task_data["audio_path"]
+    separated_dir = task_data["separated_dir"]
+    language = task_data["language"]
+    use_separator = task_data["use_separator"]
 
-    - **file**: File MP3 cần transcribe
-    - **language**: Mã ngôn ngữ (vd: vi, en, ja). Để trống để tự động nhận diện.
+    try:
+        if use_separator:
+            vocals_path = separate_vocals(audio_path, separated_dir)
+        else:
+            vocals_path = audio_path
 
-    Trả về nội dung file SRT dưới dạng text.
-    """
+        segments, info = model.transcribe(
+            vocals_path,
+            language=language,
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=False,
+            no_speech_threshold=0.6,
+            hallucination_silence_threshold=0.5
+        )
+
+        segments_list = list(segments)
+        if not segments_list:
+            raise Exception("Không thể nhận diện nội dung audio")
+
+        return create_srt_content(segments_list)
+
+    except Exception as e:
+        raise Exception(f"Lỗi xử lý: {str(e)}")
+
+
+async def worker(worker_id: int):
+    """Worker xử lý task từ queue"""
+    print(f"[INFO] Worker {worker_id} started")
+    while True:
+        task_id, task_data, event = await task_queue.get()
+        print(f"[INFO] Worker {worker_id} processing task {task_id}")
+
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(executor, process_audio_task, task_data)
+            results[task_id] = {"status": "success", "data": result}
+        except Exception as e:
+            results[task_id] = {"status": "error", "error": str(e)}
+        finally:
+            # Cleanup temp files
+            temp_dir = task_data.get("temp_dir")
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+            event.set()
+            task_queue.task_done()
+            print(f"[INFO] Worker {worker_id} finished task {task_id}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup và shutdown"""
+    global task_queue, executor
+
+    # Startup
+    load_models()
+    task_queue = asyncio.Queue()
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
+    # Start workers
+    workers = [asyncio.create_task(worker(i)) for i in range(MAX_WORKERS)]
+    print(f"[INFO] Started {MAX_WORKERS} workers")
+
+    yield
+
+    # Shutdown
+    for w in workers:
+        w.cancel()
+    executor.shutdown(wait=True)
+
+
+app = FastAPI(
+    title="MP3 to SRT API",
+    description="API chuyển đổi file MP3 thành file SRT với hàng đợi xử lý",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+
+async def submit_task(file: UploadFile, language: str, use_separator: bool) -> str:
+    """Submit task vào queue và chờ kết quả"""
+    # Validate file
     if not file.filename.lower().endswith(('.mp3', '.wav', '.m4a', '.flac', '.ogg')):
         raise HTTPException(
             status_code=400,
@@ -97,118 +178,57 @@ async def transcribe_audio(
     separated_dir = os.path.join(temp_dir, "separated")
     os.makedirs(separated_dir, exist_ok=True)
 
-    try:
-        # Ghi file upload vào file tạm
-        with open(temp_audio_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
+    with open(temp_audio_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
 
-        # Tách vocals trước khi transcribe
-        vocals_path = separate_vocals(temp_audio_path, separated_dir)
+    # Tạo task
+    task_id = str(uuid.uuid4())
+    task_data = {
+        "audio_path": temp_audio_path,
+        "separated_dir": separated_dir,
+        "language": language,
+        "use_separator": use_separator,
+        "temp_dir": temp_dir
+    }
 
-        # Transcribe với faster-whisper
-        segments, info = model.transcribe(
-            vocals_path,
-            language=language,
-            beam_size=5,
-            vad_filter=True,
-            condition_on_previous_text=False,
-            no_speech_threshold=0.6,
-            hallucination_silence_threshold=0.5
-        )
+    # Event để chờ kết quả
+    event = asyncio.Event()
 
-        # Chuyển generator thành list để xử lý
-        segments_list = list(segments)
+    # Thêm vào queue
+    queue_size = task_queue.qsize()
+    print(f"[INFO] Task {task_id} added to queue (position: {queue_size + 1})")
 
-        if not segments_list:
-            raise HTTPException(status_code=400, detail="Không thể nhận diện nội dung audio")
+    await task_queue.put((task_id, task_data, event))
 
-        # Tạo nội dung SRT
-        srt_content = create_srt_content(segments_list)
+    # Chờ worker xử lý xong
+    await event.wait()
 
-        return PlainTextResponse(
-            content=srt_content,
-            media_type="text/plain; charset=utf-8",
-            headers={
-                "Content-Disposition": f'attachment; filename="{os.path.splitext(file.filename)[0]}.srt"'
-            }
-        )
+    # Lấy kết quả
+    result = results.pop(task_id)
+    if result["status"] == "error":
+        raise HTTPException(status_code=500, detail=result["error"])
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi xử lý: {str(e)}")
-
-    finally:
-        # Dọn dẹp file tạm
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    return result["data"]
 
 
-@app.post("/transcribe/download")
-async def transcribe_and_download(
+@app.post("/transcribe", response_class=PlainTextResponse)
+async def transcribe_audio(
     file: UploadFile = File(..., description="File MP3 cần chuyển đổi"),
     language: str = None
 ):
     """
-    Chuyển đổi file MP3 và download file SRT.
-
-    - **file**: File MP3 cần transcribe
-    - **language**: Mã ngôn ngữ (vd: vi, en, ja). Để trống để tự động nhận diện.
-
-    Trả về file SRT để download.
+    Chuyển đổi file MP3 thành nội dung SRT (có tách vocals).
+    Request sẽ được đưa vào hàng đợi và xử lý tuần tự.
     """
-    if not file.filename.lower().endswith(('.mp3', '.wav', '.m4a', '.flac', '.ogg')):
-        raise HTTPException(
-            status_code=400,
-            detail="Chỉ hỗ trợ các định dạng: mp3, wav, m4a, flac, ogg"
-        )
-
-    temp_dir = tempfile.mkdtemp()
-    temp_audio_path = os.path.join(temp_dir, file.filename)
-    separated_dir = os.path.join(temp_dir, "separated")
-    os.makedirs(separated_dir, exist_ok=True)
-    srt_filename = os.path.splitext(file.filename)[0] + ".srt"
-    temp_srt_path = os.path.join(temp_dir, srt_filename)
-
-    try:
-        with open(temp_audio_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
-
-        # Tách vocals trước khi transcribe
-        vocals_path = separate_vocals(temp_audio_path, separated_dir)
-
-        segments, info = model.transcribe(
-            vocals_path,
-            language=language,
-            beam_size=5,
-            vad_filter=True,
-            condition_on_previous_text=False,
-            no_speech_threshold=0.6,
-            hallucination_silence_threshold=0.5
-        )
-
-        segments_list = list(segments)
-
-        if not segments_list:
-            raise HTTPException(status_code=400, detail="Không thể nhận diện nội dung audio")
-
-        srt_content = create_srt_content(segments_list)
-
-        # Ghi file SRT
-        with open(temp_srt_path, "w", encoding="utf-8") as f:
-            f.write(srt_content)
-
-        return FileResponse(
-            path=temp_srt_path,
-            filename=srt_filename,
-            media_type="application/x-subrip",
-            background=None
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=f"Lỗi xử lý: {str(e)}")
+    srt_content = await submit_task(file, language, use_separator=True)
+    return PlainTextResponse(
+        content=srt_content,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{os.path.splitext(file.filename)[0]}.srt"'
+        }
+    )
 
 
 @app.post("/transcribe-simple", response_class=PlainTextResponse)
@@ -216,48 +236,36 @@ async def transcribe_simple(
     file: UploadFile = File(...),
     language: str = None
 ):
-    """Test endpoint - không có audio separation"""
-    temp_dir = tempfile.mkdtemp()
-    temp_audio_path = os.path.join(temp_dir, file.filename)
-
-    try:
-        with open(temp_audio_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
-
-        print(f"[DEBUG] Transcribing: {temp_audio_path}")
-
-        segments, info = model.transcribe(
-            temp_audio_path,
-            language=language,
-            beam_size=5,
-            vad_filter=True,
-            condition_on_previous_text=False,
-            no_speech_threshold=0.6,
-            hallucination_silence_threshold=0.5
-        )
-
-        segments_list = list(segments)
-        print(f"[DEBUG] Found {len(segments_list)} segments")
-
-        srt_content = create_srt_content(segments_list)
-        return PlainTextResponse(content=srt_content)
-
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    """Chuyển MP3 thành SRT (không tách vocals)"""
+    srt_content = await submit_task(file, language, use_separator=False)
+    return PlainTextResponse(content=srt_content)
 
 
 @app.get("/")
 async def root():
     """API Info"""
+    queue_size = task_queue.qsize() if task_queue else 0
     return {
         "message": "MP3 to SRT API",
+        "version": "2.0.0",
+        "workers": MAX_WORKERS,
+        "queue_size": queue_size,
         "docs": "/docs",
         "endpoints": {
             "/transcribe": "POST - Chuyển MP3 thành SRT (có tách vocals)",
             "/transcribe-simple": "POST - Chuyển MP3 thành SRT (không tách vocals)",
-            "/transcribe/download": "POST - Download file SRT"
+            "/queue-status": "GET - Xem trạng thái hàng đợi"
         }
+    }
+
+
+@app.get("/queue-status")
+async def queue_status():
+    """Xem trạng thái hàng đợi"""
+    return {
+        "workers": MAX_WORKERS,
+        "queue_size": task_queue.qsize() if task_queue else 0,
+        "pending_results": len(results)
     }
 
 
