@@ -2,17 +2,19 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive \
+    HF_HOME=/app/hf_cache
 
-# Install ffmpeg and build tools
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg gcc build-essential && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app
 COPY main.py .
+
+RUN mkdir -p hf_cache
 
 EXPOSE 8000
 
